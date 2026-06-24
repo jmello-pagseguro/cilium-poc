@@ -1,0 +1,30 @@
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: "allow-github-only"
+  namespace: cilium-poc
+spec:
+  endpointSelector:
+    matchLabels:
+      app: app-1
+  egress:
+  # 1. Liga o Proxy L7 para o Cilium "escutar" os IPs e popular o cache
+  - toEndpoints:
+    - matchLabels:
+        "io.kubernetes.pod.namespace": kube-system
+        "k8s-app": kube-dns
+    toPorts:
+    - ports:
+      - port: "53"
+        protocol: ANY
+      rules:
+        dns:
+        - matchPattern: "*"
+  
+# Regra de FQDN estrita e cirúrgica
+  - toFQDNs:
+    - matchName: "api.github.com"
+    toPorts:
+    - ports:
+      - port: "443"
+        protocol: TCP
