@@ -16,10 +16,9 @@ spec:
     - ports:
       - port: "53"
         protocol: ANY
-        
-  - toFQDNs:
-    - matchName: "httpbin.org"
-    toPorts:
+  - toPorts:
     - ports:
       - port: "443"
         protocol: TCP
+      serverNames:
+      - "httpbin.org"

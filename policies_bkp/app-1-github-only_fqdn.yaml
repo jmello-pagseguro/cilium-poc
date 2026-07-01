@@ -27,4 +27,4 @@ spec:
     toPorts:
     - ports:
       - port: "443"
-        protocol: TCP
+        protocol: TCP 
