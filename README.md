@@ -1,10 +1,16 @@
 # PoC: Cilium eBPF como CNI e Security Policy Engine no K3s
 
-Esta Prova de Conceito (PoC) demonstra a substituição da infraestrutura de rede tradicional (IPTables/Flannel) pelo Cilium, utilizando eBPF para roteamento de alta performance e controle de tráfego de saída (Egress) baseado em FQDN (Fully Qualified Domain Name).
+PoC para validar controle de egress com Cilium em Kubernetes.
+
+Escopo:
+
+- FQDN para destinos externos com IP dinâmico
+- `serverNames` para controle por SNI em TLS
+- `toCIDR` para liberação direta por IP/porta
 
 ## Arquitetura do projeto
 
-A estrutura de diretórios foi organizada para separar a infraestrutura lógica, as aplicações de teste e as políticas de segurança:
+Estrutura do projeto:
 
 ```
 .
@@ -15,31 +21,158 @@ A estrutura de diretórios foi organizada para separar a infraestrutura lógica,
 ├── namespaces/
 │   └── cilium-poc.yaml         # Namespace dedicado para a PoC
 └── policies/
-        ├── app-1-github-only.yaml  # Libera tráfego apenas para *.github.com
-        └── app-2-httpbin-only.yaml # Libera tráfego apenas para *.httpbin.org
+    ├── app-1-github-only.yaml  # Libera tráfego apenas para *.github.com via FQDN
+    ├── app-2-httpbin-only.yaml  # Libera tráfego HTTPS para httpbin.org via TLS SNI
+    └── app-2-ssh-only.yaml      # Libera SSH da app-2 para um IP fixo
 ```
 
-## Por que Cilium e não Istio? (eBPF vs Sidecar)
+## Por que Cilium
 
-Para resolver o desafio de controle de tráfego e segurança, o ecossistema Kubernetes tradicionalmente recorre ao Istio. No entanto, esta PoC valida o Cilium como uma alternativa moderna por diferenças fundamentais na arquitetura:
+Comparação resumida:
 
-**O Modelo Istio (Sidecar):** o Istio injeta um contêiner proxy (Envoy) dentro de cada pod da aplicação. Todo pacote de rede precisa sair da aplicação, passar pelas regras de IPTables do Linux, entrar no Envoy, ser processado, voltar pro IPTables e só então sair para a rede. Isso gera um grande overhead de CPU, memória e latência.
+- Cilium aplica policy direto no datapath com eBPF
+- Istio adiciona sidecar e gateway para resolver o mesmo fluxo
+- Cilium encaixa melhor quando a meta é egress simples e previsível
+- Istio faz mais sentido quando a meta é malha completa e terminação centralizada
 
-**O Modelo Cilium (eBPF / Sidecarless):** o Cilium roda a nível de kernel (eBPF). Ele não injeta proxies em cada pod para tarefas de L3/L4; os pacotes são interceptados diretamente na interface de rede virtual do pod com performance nativa.
+## Cilium x Istio egress gateway
 
-## Escopo atual — Controle FQDN via DNS (L4)
+Use Cilium quando quiser:
 
-Atualmente, esta PoC implementa restrição de saída baseada em FQDN operando na camada 4.
+- reduzir componentes
+- manter L3/L4 e SNI na própria policy
+- evitar mistura entre roteamento, proxy e autorização
+- tratar SSH, FQDN e TLS SNI com regras separadas
 
-**Como funciona:** o Cilium intercepta as requisições DNS (porta 53) dos pods, lê as respostas e armazena os IPs resolvidos (ex.: os IPs dinâmicos da api.github.com) em um cache. Em seguida, ele libera a porta 443 apenas para esses IPs em L4.
+Use Istio egress gateway quando precisar de:
 
-**Gap de segurança (Spoofing de IP/CDN):** se `api.github.com` e um domínio malicioso `hacker.github.io` compartilharem o mesmo IP de um provedor de CDN, a liberação por L4 permitirá o tráfego para ambos, pois o IP de destino é o mesmo.
+- terminação TLS centralizada
+- inspeção L7 profunda
+- roteamento avançado de malha
+- padronização de tráfego de saída em um gateway único
 
-**Próximos passos (L7):** para fechar esse gap e validar a URL exata independentemente do IP, o Cilium possui integração nativa com o Envoy para realizar inspeção HTTP (camada 7) via cabeçalho `Host`. Isso será explorado na próxima fase da PoC.
+## Padrões de policy
 
-## Passo a passo de instalação (Ubuntu 24.04 compatível)
+### FQDN
 
-O ambiente de testes foi configurado no Ubuntu 24.04. Para evitar conflitos de DNS conhecidos entre o eBPF do Cilium e o `systemd-resolved` do hospedeiro, utilizamos a seguinte receita de instalação "blindada".
+- indicado para destinos externos com IP variável
+- depende do DNS do pod
+- pode liberar IP compartilhado por outros hosts
+
+### `serverNames`
+
+- indicado para HTTPS com SNI visível
+- distingue hosts no handshake TLS
+- evita o problema de cache por IP do FQDN
+- não substitui inspeção HTTP dentro do TLS
+
+### `toCIDR`
+
+- indicado para IP fixo
+- útil para SSH e outros protocolos sem hostname
+- simples e previsível
+
+## Limitações
+
+- `serverNames` depende de SNI
+- FQDN continua sujeito a compartilhamento de IP
+- inspeção de `Host` e path em HTTPS exige L7/proxy
+- ECH/ESNI podem reduzir visibilidade do SNI
+
+## L7 (HTTP/HTTPS) — Opções e requisitos
+
+- O que o L7 consegue: para HTTP em claro (porta 80) o Cilium consegue inspecionar e filtrar por `method`, `path` e `headers` (incluindo `Host`). Isso funciona sem terminação TLS porque o proxy vê o tráfego em texto.
+- HTTPS: existem duas opções principais:
+    - `serverNames` (SNI): aplica-se no ClientHello do TLS e permite distinguir destinos pelo nome sem descriptografar o tráfego. Não vê `Host` HTTP nem path.
+    - Terminação/interceptação TLS (L7 proxy): se o proxy (Envoy/Cilium) terminar o TLS, então o tráfego é descriptografado e as regras HTTP (Host, path, method, headers) podem ser aplicadas.
+- Requisitos mínimos para usar L7 com inspeção HTTPS (terminação):
+    - Cilium deve ter o suporte a L7/Envoy ativado (feature proxy/L7 habilitada na instalação).
+    - Segredos de TLS (certificado/chave/CA) precisam estar disponíveis para o proxy terminar TLS — geralmente via Kubernetes Secret e com as flags de sincronização de policy-secret do Cilium se aplicável.
+    - Considerar confiança/CA: interceptar TLS externo exige que clientes confiem no certificado/CA usado pelo proxy (complexo para destinos públicos).
+- Limitações operacionais e riscos:
+    - Terminar TLS aumenta complexidade operacional, exigindo gestão de certificados e possíveis alterações na confiança dos clientes.
+    - CDN e IPs compartilhados continuam a criar colisões quando se usa apenas `toFQDN`.
+    - Tecnologias que ocultam SNI (ECH/ESNI) reduzem eficácia de `serverNames`.
+
+Próximo passo: para testes locais é simples criar uma policy L7 para HTTP (ex.: bloquear por `Host`/`path`) — para HTTPS, preparar a parte de certificados e as flags do Cilium antes de tentar a terminação.
+
+Exemplos de policies L7 (exemplos completos abaixo):
+
+HTTP L7 (inspeção de header `Host`, method e path):
+
+```yaml
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+    name: app-2-http-l7
+    namespace: cilium-poc
+spec:
+    endpointSelector:
+        matchLabels:
+            app: app-2
+    egress:
+    - toPorts:
+        - ports:
+            - port: "80"
+                protocol: TCP
+            rules:
+                http:
+                - method: "GET"
+                    path: "/status"
+                - headers:
+                    - name: "Host"
+                        exact: "example.com"
+```
+
+HTTPS L7 com terminação (requere secret/terminação TLS):
+
+```yaml
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+    name: app-2-https-l7-terminate
+    namespace: cilium-poc
+spec:
+    endpointSelector:
+        matchLabels:
+            app: app-2
+    egress:
+    - toPorts:
+        - ports:
+            - port: "443"
+                protocol: TCP
+            terminatingTLS:
+                secret:
+                    name: externaltarget-tls
+            rules:
+                http:
+                - method: "GET"
+                    path: "/anything"
+                - headers:
+                    - name: "Host"
+                        exact: "httpbin.org"
+```
+
+Policy única com TLS termination para liberar por `Host`:
+
+- Use `terminatingTLS` no `toPorts` da porta `443` e coloque a regra HTTP com `host: "api.github.com"`.
+- Crie um Secret com a chave e o certificado que o Envoy vai apresentar ao pod. Para a policy acima, o Secret usado é `github-egress-tls`.
+- Habilite o uso de Secrets de policy no Cilium para evitar leitura ampla do cluster:
+
+```bash
+cilium config set enable-l7-proxy true
+cilium config set enable-policy-secrets-sync true
+cilium config set policy-secrets-only-from-secrets-namespace true
+cilium config set policy-secrets-namespace cilium-secrets
+```
+
+- Se o destino for público, você só consegue "garantir" o certificado se controlar a CA confiada pelo cliente ou se o alvo já for o seu próprio endpoint. Para GitHub público, essa abordagem só faz sentido em laboratório ou com proxy/CA sob seu controle.
+
+## Instalação
+
+Ambiente de referência: Ubuntu 24.04.
+
+Para evitar conflitos de DNS entre o eBPF do Cilium e o `systemd-resolved` do hospedeiro, usamos a seguinte receita.
 
 ### 1) Instalação do K3s (sem CNI padrão)
 
@@ -51,7 +184,7 @@ curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='--flannel-backend=none --disabl
 
 ### 2) Configuração do kubeconfig
 
-Para garantir que o seu usuário tenha as permissões corretas para operar o cluster sem uso de `sudo`:
+Para operar o cluster sem `sudo`:
 
 ```bash
 sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
@@ -62,7 +195,7 @@ export KUBECONFIG=~/.kube/config
 
 ### 3) Instalação do Cilium (versão recomendada: 1.19.5+)
 
-Nota: é crucial usar a versão 1.19.5 ou superior para garantir as correções de compatibilidade com o Ubuntu 24.04.
+Nota: use Cilium 1.19.5 ou superior.
 
 Instalamos o Cilium substituindo o kube-proxy nativo, mas protegendo explicitamente os serviços do hospedeiro (`hostServices.enabled=false`) para não derrubar o DNS da máquina física.
 
@@ -77,9 +210,9 @@ cilium install --version 1.19.5 \
 cilium status --wait
 ```
 
-## Validando a PoC
+## Validação
 
-Com o Cilium operante, aplique as aplicações e as políticas para testar o filtro.
+Com o Cilium operante, aplique apps e policies:
 
 ### Subir o ambiente
 
@@ -89,12 +222,12 @@ kubectl apply -f apps/
 kubectl apply -f policies/
 ```
 
-### Testes de conectividade (dentro do namespace `cilium-poc`)
+### Testes de conectividade
 
 ```bash
-# Deve retornar HTTP 200 (app-1 possui permissão para *.github.com)
+# Deve retornar HTTP 200
 kubectl exec -it deploy/app-1 -n cilium-poc -- curl -I https://api.github.com
 
-# Deve falhar/timeout para destinos não permitidos
+# Deve falhar/timeout
 kubectl exec -it deploy/app-1 -n cilium-poc -- curl -m 5 -I https://httpbin.org
 ```

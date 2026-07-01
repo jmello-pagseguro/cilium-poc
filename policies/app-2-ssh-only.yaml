@@ -1,0 +1,16 @@
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: app-2-ssh-only
+  namespace: cilium-poc
+spec:
+  endpointSelector:
+    matchLabels:
+      app: app-2
+  egress:
+  - toCIDR:
+    - 20.201.28.152/32
+    toPorts:
+    - ports:
+      - port: "22"
+        protocol: TCP
